@@ -30,6 +30,10 @@ Model (logit space, hierarchical, regime-pooled):
   then residualized the same way to give u at the target.
 * Slopes (and curvature) are pooled toward their regime mean, weighted by
   how many informative refreshes the trophy has (empirical-Bayes shrinkage).
+  A negative slope for a Saturated/Diluting trophy is additionally halved
+  (SAT_SLOPE_DAMP): a high-rate trophy's decline is a mix shift, not a
+  logit-linear process, and extrapolating the steep logit drop from 100%
+  linearly overshoots downward.
 * A runtime backtest splits the refreshes ~60/40, fits on the early part,
   predicts the later refreshes, and picks the damping / shrinkage /
   linear-vs-quadratic setting with the lowest mean logit-pinball loss.
@@ -72,6 +76,27 @@ DAMP_HORIZON_K = 0.35
 # Shrinkage of the dilution coefficient toward -1: c is only identified
 # from refresh jumps, so when u barely varies the theoretical value wins.
 C_SHRINK_K = 0.02
+# Damping of a NEGATIVE logit slope for Saturated/Diluting trophies: a
+# high-rate trophy's decline is a mix shift (new players diluting the
+# early-adopter share), not a logit-linear process. The logit of a rate near
+# 100% is extremely steep, so the fitted decline overstates the forward
+# drift and extrapolating it linearly overshoots downward (the 100% trophy's
+# true decline decelerates as the new-player share stabilizes). Halve the
+# extrapolated negative slope for saturated trophies; rising or flat slopes
+# are untouched.
+SAT_SLOPE_DAMP = 0.5
+
+
+def damp_saturated_slope(b_s, regime):
+    """Damp a negative logit slope for a Saturated/Diluting trophy.
+
+    Returns b_s * SAT_SLOPE_DAMP when the trophy is saturated and its pooled
+    slope is negative, else b_s unchanged. Applied in both the backtest and
+    the forecast so the two see the same model.
+    """
+    if regime == "saturated" and b_s < 0.0:
+        return b_s * SAT_SLOPE_DAMP
+    return b_s
 
 
 def clamp_pct(x):
@@ -534,6 +559,7 @@ def backtest(data, refreshes, horizon_days, x_target):
                     npts = early_n[t]
                     reg = regimes[t]
                     b_s = (npts * b + shrink * mean_b[reg]) / (npts + shrink)
+                    b_s = damp_saturated_slope(b_s, reg)
                     d_s = d
                     if uq:
                         kd = 3.0 * shrink
@@ -661,6 +687,7 @@ def forecast_case(case):
         a, b, c, d, _uu, uq = fit
         reg = regime
         b_s = (npts * b + shrink * mean_b[reg]) / (npts + shrink)
+        b_s = damp_saturated_slope(b_s, reg)
         d_s = d
         if uq:
             kd = 3.0 * shrink
