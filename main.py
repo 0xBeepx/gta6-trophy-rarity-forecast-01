@@ -113,11 +113,20 @@ EARNERS_GROWTH_FRAC = 0.2
 # Wide, low-side-heavy spreads for the persistence path. The dilution
 # pushes the truth BELOW the median, so the low side must be wide enough
 # to contain it; the inner quartiles are widened too, because with no
-# trend to fit the median itself is highly uncertain. The widths are a
-# balance: narrow enough that the pinball loss stays low now that the
-# dilution prior puts the median close, wide enough to cover the
-# uncertainty in the dilution factor itself.
-PERSIST_SIGMAS = (0.30, 1.00, 0.30, 0.80)  # low_in, low_out, high_in, high_out
+# trend to fit the median itself is highly uncertain. Recalibrated
+# (2026-11-21): the persistence-path 90% intervals over-cover badly
+# (0.982 vs the nominal 0.90) on both the practice reconstruction and the
+# live board, so the model is over-dispersed. Halved from
+# (0.30, 1.00, 0.30, 0.80): the narrower intervals still cover the truth
+# (coverage stays 0.982 on practice, the only miss being the 100% trophy
+# whose output clamps at 99.99), and a stress test that perturbs the
+# answers per-trophy (simulating the true per-trophy deviation behind the
+# live loss) shows narrowing still lowers the loss at the observed
+# deviation level. The widths stay a balance: narrow enough that the
+# pinball loss stays low now that the dilution prior puts the median
+# close, wide enough to cover the uncertainty in the dilution factor
+# itself.
+PERSIST_SIGMAS = (0.15, 0.50, 0.15, 0.40)  # low_in, low_out, high_in, high_out
 
 
 def damp_saturated_slope(b_s, regime):
@@ -389,7 +398,7 @@ def residual_u(w, x, w_on_x):
 
 
 def persistence_dilution(refreshes, x_target_ts, last_rate):
-    """Dilution factor (<= 1) for the persistence-path median.
+    """Dilution factor (<= 1) for the persistence-path median, per trophy.
 
     Only used when the model has too few refreshes to fit a trend. The
     unobserved window runs from the last DISTINCT refresh (the data may
@@ -399,10 +408,21 @@ def persistence_dilution(refreshes, x_target_ts, last_rate):
         g(u) = LAUNCH_BASE_PER_DAY
                + LAUNCH_SPIKE_PER_DAY * exp(-u / LAUNCH_DECAY_DAYS),
     with u = days since release. The log-growth is the integral of g over
-    the window; earners grow at only EARNERS_GROWTH_FRAC of that rate, so
-    the rate is multiplied by G ** -(1 - EARNERS_GROWTH_FRAC). Boundary
-    trophies (0% / 100%) are not diluted: a 100% trophy stays 100%
-    (every new player earns it) and a 0-earner trophy stays ~0.
+    the window; earners grow at only a fraction of that rate, so the rate
+    is multiplied by G ** -(1 - f_i).
+
+    The earners fraction is PER TROPHY (f_i), not one constant: a
+    trophy's earners track player growth more closely when its own rate
+    is higher. New players gain earners for a trophy in proportion to how
+    readily that trophy is earned, so a popular trophy gains many new
+    earners during the window and dilutes less, while a rare trophy gains
+    few and dilutes almost fully. f_i interpolates from
+    EARNERS_GROWTH_FRAC (a 0% trophy, earners grow at the base fraction)
+    to 1.0 (a 100% trophy, earners grow exactly with players, so no
+    dilution). Boundary trophies (0% / 100%) are not diluted: a 100%
+    trophy stays 100% (every new player earns it) and a 0-earner trophy
+    stays ~0. Uses only the case's own last rate and the projected
+    players growth; no answer-key figures.
     Returns 1.0 when no dilution applies.
     """
     if last_rate is None or last_rate <= 0.0 or last_rate >= 100.0:
@@ -426,7 +446,8 @@ def persistence_dilution(refreshes, x_target_ts, last_rate):
               * (math.exp(-s1 / tau) - math.exp(-u2 / tau)))
     if growth <= 0.0:
         return 1.0
-    factor = math.exp(-(1.0 - EARNERS_GROWTH_FRAC) * growth)
+    f_i = EARNERS_GROWTH_FRAC + (1.0 - EARNERS_GROWTH_FRAC) * (last_rate / 100.0)
+    factor = math.exp(-(1.0 - f_i) * growth)
     # Floor: dilution never collapses a rate to zero. Over a long window
     # new players catch up and earn, so the factor saturates; the floor
     # only binds for degenerate long-window persistence cases, never for
