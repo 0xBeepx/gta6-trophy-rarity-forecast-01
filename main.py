@@ -34,6 +34,13 @@ Model (logit space, hierarchical, regime-pooled):
   (SAT_SLOPE_DAMP): a high-rate trophy's decline is a mix shift, not a
   logit-linear process, and extrapolating the steep logit drop from 100%
   linearly overshoots downward.
+* When the model has too few refreshes to fit a trend it falls back to
+  persistence, but with a launch-spike dilution prior: a flat history
+  usually means the data is STALE (Exophase has not refreshed since before
+  the release), so by the target new players dilute the rates. The median
+  is shifted down by a dilution factor from the projected players growth
+  over the unobserved window, and the spreads are wide and low-side-heavy
+  (the dilution pushes the truth below the median).
 * A runtime backtest splits the refreshes ~60/40, fits on the early part,
   predicts the later refreshes, and picks the damping / shrinkage /
   linear-vs-quadratic setting with the lowest mean logit-pinball loss.
@@ -85,6 +92,32 @@ C_SHRINK_K = 0.02
 # extrapolated negative slope for saturated trophies; rising or flat slopes
 # are untouched.
 SAT_SLOPE_DAMP = 0.5
+
+# Launch-spike dilution prior (persistence path only, see
+# persistence_dilution). When the model has too few refreshes to fit a
+# trend it falls back to persistence (last rate). But in launch week a flat
+# history usually means the data is STALE (Exophase has not refreshed since
+# before the release), not that the player base is static. By the target,
+# new players will have joined and diluted the rates: a trophy's rate falls
+# as players who have not earned it join. The dilution is estimated from
+# the projected players growth over the unobserved window (last distinct
+# refresh to the target). Players grow at a launch-spike rate right after
+# the midnight release that decays to a sustained launch-week rate, so the
+# growth over a long window (the final's 4.5 days) stays sane while the
+# first-hours spike is captured. Earners grow at only a fraction of the
+# players rate (new players earn slowly).
+LAUNCH_SPIKE_PER_DAY = 10.0   # log-players/day at the release spike
+LAUNCH_BASE_PER_DAY = 0.5     # sustained log-players/day, launch week
+LAUNCH_DECAY_DAYS = 0.5       # spike decay timescale (12 h)
+EARNERS_GROWTH_FRAC = 0.2
+# Wide, low-side-heavy spreads for the persistence path. The dilution
+# pushes the truth BELOW the median, so the low side must be wide enough
+# to contain it; the inner quartiles are widened too, because with no
+# trend to fit the median itself is highly uncertain. The widths are a
+# balance: narrow enough that the pinball loss stays low now that the
+# dilution prior puts the median close, wide enough to cover the
+# uncertainty in the dilution factor itself.
+PERSIST_SIGMAS = (0.30, 1.00, 0.30, 0.80)  # low_in, low_out, high_in, high_out
 
 
 def damp_saturated_slope(b_s, regime):
@@ -355,6 +388,52 @@ def residual_u(w, x, w_on_x):
     return w - (alpha + beta * x)
 
 
+def persistence_dilution(refreshes, x_target_ts, last_rate):
+    """Dilution factor (<= 1) for the persistence-path median.
+
+    Only used when the model has too few refreshes to fit a trend. The
+    unobserved window runs from the last DISTINCT refresh (the data may
+    have been frozen since then) to the target. Players are projected to
+    grow over that window at a launch rate that spikes at the release and
+    decays to a sustained launch-week rate:
+        g(u) = LAUNCH_BASE_PER_DAY
+               + LAUNCH_SPIKE_PER_DAY * exp(-u / LAUNCH_DECAY_DAYS),
+    with u = days since release. The log-growth is the integral of g over
+    the window; earners grow at only EARNERS_GROWTH_FRAC of that rate, so
+    the rate is multiplied by G ** -(1 - EARNERS_GROWTH_FRAC). Boundary
+    trophies (0% / 100%) are not diluted: a 100% trophy stays 100%
+    (every new player earns it) and a 0-earner trophy stays ~0.
+    Returns 1.0 when no dilution applies.
+    """
+    if last_rate is None or last_rate <= 0.0 or last_rate >= 100.0:
+        return 1.0
+    if not refreshes:
+        return 1.0
+    try:
+        last_distinct_ts = parse_ts(refreshes[-1]["at"])
+    except Exception:
+        return 1.0
+    u1 = (last_distinct_ts - RELEASE.timestamp()) / 86400.0
+    u2 = (x_target_ts - RELEASE.timestamp()) / 86400.0
+    if u2 <= u1:
+        return 1.0
+    tau = LAUNCH_DECAY_DAYS
+    # Sustained growth over the whole window; the spike only counts
+    # post-release (u >= 0).
+    s1 = max(u1, 0.0)
+    growth = (LAUNCH_BASE_PER_DAY * (u2 - u1)
+              + LAUNCH_SPIKE_PER_DAY * tau
+              * (math.exp(-s1 / tau) - math.exp(-u2 / tau)))
+    if growth <= 0.0:
+        return 1.0
+    factor = math.exp(-(1.0 - EARNERS_GROWTH_FRAC) * growth)
+    # Floor: dilution never collapses a rate to zero. Over a long window
+    # new players catch up and earn, so the factor saturates; the floor
+    # only binds for degenerate long-window persistence cases, never for
+    # the short-window launch case this prior is built for.
+    return min(1.0, max(0.05, factor))
+
+
 # --------------------------------------------------------------------------
 # Regimes and quantile spreads.
 # --------------------------------------------------------------------------
@@ -610,9 +689,11 @@ def forecast_case(case):
     history = case.get("history") or []
     horizon_days = float(case.get("horizon_minutes", 0)) / 1440.0
     try:
-        x_target = log_time(parse_ts(case["target"]))
+        target_ts = parse_ts(case["target"])
+        x_target = log_time(target_ts)
     except Exception:
-        x_target = log_time(parse_ts(history[-1]["at"])) if history else 0.0
+        target_ts = parse_ts(history[-1]["at"]) if history else 0.0
+        x_target = log_time(target_ts) if history else 0.0
 
     refreshes = dedup_refreshes(history)
     data = trophy_points(trophies, refreshes)
@@ -673,10 +754,16 @@ def forecast_case(case):
         fit = raw[t]
 
         if fit is None or npts < 3:
-            # Persistence: median is the last rate, regime spread.
+            # Persistence with a launch-spike dilution prior and wide,
+            # low-side-heavy spreads (see persistence_dilution). With no
+            # trend to fit, the last rate is a stale snapshot; by the
+            # target, launch influx dilutes it, and the uncertainty is
+            # dominated by that dilution, not the regime.
             med_rate = last_rate if last_rate is not None else global_median_rate
+            dil = persistence_dilution(refreshes, target_ts, med_rate)
+            med_rate = clamp_pct(med_rate * dil)
             y_med = logit_pct(med_rate)
-            sg = widen_outer(sigmas_for(med_rate, regime), npts)
+            sg = PERSIST_SIGMAS
             rows.append({"id": trophy["id"],
                          "q": quantiles_from(y_med, sg)})
             continue
